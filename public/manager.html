@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Manager – Multi-Agent Live Monitoring</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f5f5f5;
+      padding: 20px;
+    }
+
+    .agent-card {
+      background: #ffffff;
+      border: 1px solid #ccc;
+      padding: 14px;
+      margin-bottom: 18px;
+    }
+
+    .meta {
+      font-size: 13px;
+      color: #555;
+      margin-bottom: 8px;
+    }
+
+    .box {
+      background: #000;
+      color: #0f0;
+      padding: 8px;
+      height: 140px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+
+    .summary {
+      border: 2px solid #4caf50;
+      padding: 10px;
+      background: #f9fff9;
+      min-height: 50px;
+      font-size: 14px;
+    }
+
+    h3 {
+      margin: 4px 0 6px;
+    }
+
+    h4 {
+      margin: 6px 0;
+    }
+
+    .ended {
+      opacity: 0.75;
+      background: #f0f0f0;
+    }
+  </style>
+</head>
+<body>
+
+<h2>📊 Manager – Multi-Agent Live Monitoring</h2>
+
+<div id="agents"></div>
+
+<script>
+const agentsContainer = document.getElementById("agents");
+
+/*
+  callId → {
+    card,
+    mic,
+    tab,
+    summary,
+    durationEl,
+    timer,
+    startTime
+  }
+*/
+const calls = {};
+
+/* ================= CREATE CALL CARD ================= */
+function createCallCard(agent, callId, startTime) {
+  if (calls[callId]) return;
+
+  const card = document.createElement("div");
+  card.className = "agent-card";
+  card.dataset.callId = callId;
+
+  const startedAt = new Date(startTime).toLocaleTimeString();
+
+  card.innerHTML = `
+    <h3>👤 ${agent}</h3>
+
+    <div class="meta">
+      <strong>Started:</strong> ${startedAt} |
+      <span id="duration-${callId}"><strong>Duration:</strong> 00:00</span>
+    </div>
+
+    <h4>🎤 Mic</h4>
+    <div class="box" id="mic-${callId}"></div>
+
+    <h4>🖥️ Tab Audio</h4>
+    <div class="box" id="tab-${callId}"></div>
+
+    <h4>🧠 Call Summary</h4>
+    <div class="summary" id="summary-${callId}">
+      <em>Call in progress…</em>
+    </div>
+  `;
+
+  /* 🔝 Newest calls on TOP */
+  agentsContainer.prepend(card);
+
+  const durationEl = card.querySelector(`#duration-${callId}`);
+
+  const timer = setInterval(() => {
+    const diff = Math.floor((Date.now() - startTime) / 1000);
+    const m = Math.floor(diff / 60);
+    const s = diff % 60;
+    durationEl.innerHTML =
+      `<strong>Duration:</strong> ${m}:${s.toString().padStart(2, "0")}`;
+  }, 1000);
+
+  calls[callId] = {
+    card,
+    mic: card.querySelector(`#mic-${callId}`),
+    tab: card.querySelector(`#tab-${callId}`),
+    summary: card.querySelector(`#summary-${callId}`),
+    durationEl,
+    timer,
+    startTime
+  };
+}
+
+/* ================= WEBSOCKET (PRODUCTION-SAFE) ================= */
+const protocol = location.protocol === "https:" ? "wss" : "ws";
+const ws = new WebSocket(`${protocol}://${location.host}`);
+
+ws.onmessage = (e) => {
+  let msg;
+  try { msg = JSON.parse(e.data); } catch { return; }
+
+  /* ===== AGENT START ===== */
+  if (msg.type === "agent_join") {
+    createCallCard(msg.agent, msg.callId, msg.startTime);
+    return;
+  }
+
+  /* ===== TRANSCRIPT ===== */
+  if (msg.type === "transcript" && msg.final) {
+    const call = calls[msg.callId];
+    if (!call) return;
+
+    const box = msg.source === "mic" ? call.mic : call.tab;
+    box.innerHTML += msg.text + "<br>";
+    box.scrollTop = box.scrollHeight;
+    return;
+  }
+
+  /* ===== SUMMARY / CALL END ===== */
+  if (msg.type === "summary") {
+    const call = calls[msg.callId];
+    if (!call) return;
+
+    clearInterval(call.timer);
+
+    call.durationEl.innerHTML += " (Final)";
+    call.summary.innerHTML =
+      `<strong>Summary</strong><br>${msg.summary.replace(/\n/g, "<br>")}`;
+
+    call.card.classList.add("ended");
+  }
+};
+</script>
+
+</body>
+</html>
