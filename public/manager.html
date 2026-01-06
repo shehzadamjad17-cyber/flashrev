@@ -1,177 +1,263 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8" />
-  <title>Manager – Multi-Agent Live Monitoring</title>
+  <meta charset="UTF-8">
+  <title>Manager – Agent Call Monitor</title>
 
   <style>
     body {
       font-family: Arial, sans-serif;
-      background: #f5f5f5;
+      background: #f4f6f8;
       padding: 20px;
     }
 
-    .agent-card {
-      background: #ffffff;
+    h2 { margin-bottom: 16px; }
+
+    /* LOGIN */
+    #login {
+      max-width: 320px;
+      margin: 80px auto;
+      background: #fff;
+      padding: 20px;
       border: 1px solid #ccc;
-      padding: 14px;
-      margin-bottom: 18px;
     }
+
+    input {
+      width: 100%;
+      padding: 8px;
+      margin: 6px 0;
+    }
+
+    button {
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+
+    #dashboard { display: none; }
+
+    /* AGENT SECTIONS */
+    .agent-section {
+      margin-bottom: 32px;
+      border-bottom: 2px solid #ddd;
+      padding-bottom: 16px;
+    }
+
+    .agent-title {
+      font-size: 18px;
+      font-weight: bold;
+      margin-bottom: 10px;
+    }
+
+    /* ONE HORIZONTAL SEQUENCE */
+    .calls-grid {
+      display: flex;
+      gap: 14px;
+      overflow-x: auto;
+      padding-bottom: 6px;
+    }
+
+    .call-card {
+      min-width: 340px;
+      background: #fff;
+      border: 1px solid #ccc;
+      padding: 12px;
+      position: relative;
+    }
+
+    .call-card.ended {
+      opacity: 0.75;
+      background: #f0f0f0;
+    }
+
+    .status {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      padding: 3px 8px;
+      font-size: 12px;
+      color: #fff;
+      border-radius: 4px;
+    }
+
+    .live { background: #4caf50; }
+    .ended-status { background: #777; }
 
     .meta {
       font-size: 13px;
       color: #555;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
 
     .box {
       background: #000;
       color: #0f0;
-      padding: 8px;
-      height: 140px;
+      padding: 6px;
+      height: 110px;
       overflow-y: auto;
       font-family: monospace;
       font-size: 13px;
-      margin-bottom: 10px;
+      margin-bottom: 8px;
     }
 
     .summary {
       border: 2px solid #4caf50;
-      padding: 10px;
       background: #f9fff9;
-      min-height: 50px;
+      padding: 8px;
       font-size: 14px;
-    }
-
-    h3 {
-      margin: 4px 0 6px;
-    }
-
-    h4 {
-      margin: 6px 0;
-    }
-
-    .ended {
-      opacity: 0.75;
-      background: #f0f0f0;
+      min-height: 40px;
     }
   </style>
 </head>
 <body>
 
-<h2>📊 Manager – Multi-Agent Live Monitoring</h2>
+<h2>📊 Manager – Live Call Monitoring</h2>
 
-<div id="agents"></div>
+<!-- LOGIN -->
+<div id="login">
+  <h3>Manager Login</h3>
+  <input id="username" placeholder="Username" />
+  <input id="password" type="password" placeholder="Password" />
+  <button id="loginBtn">Login</button>
+</div>
+
+<!-- DASHBOARD -->
+<div id="dashboard">
+  <div id="agents"></div>
+</div>
 
 <script>
-const agentsContainer = document.getElementById("agents");
+const loginDiv = document.getElementById("login");
+const dashDiv = document.getElementById("dashboard");
+const agentsRoot = document.getElementById("agents");
 
-/*
-  callId → {
-    card,
-    mic,
-    tab,
-    summary,
-    durationEl,
-    timer,
-    startTime
-  }
-*/
-const calls = {};
+const agentSections = {}; // agent -> calls grid
+const calls = {};         // callId -> call refs
+let ws;
 
-/* ================= CREATE CALL CARD ================= */
-function createCallCard(agent, callId, startTime) {
-  if (calls[callId]) return;
+/* ================= CONNECT WS ================= */
+function connectWS(username, password) {
+  ws = new WebSocket(
+    (location.protocol === "https:" ? "wss://" : "ws://") + location.host
+  );
 
-  const card = document.createElement("div");
-  card.className = "agent-card";
-  card.dataset.callId = callId;
+  ws.onopen = () => {
+    // 🔐 SERVER-DRIVEN AUTH (same as reference)
+    ws.send(JSON.stringify({
+      type: "auth",
+      username,
+      password
+    }));
+  };
 
-  const startedAt = new Date(startTime).toLocaleTimeString();
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
 
-  card.innerHTML = `
-    <h3>👤 ${agent}</h3>
+    /* ===== AUTH ===== */
+    if (msg.type === "auth_failed") {
+      alert("Invalid manager credentials");
+      ws.close();
+      return;
+    }
 
-    <div class="meta">
-      <strong>Started:</strong> ${startedAt} |
-      <span id="duration-${callId}"><strong>Duration:</strong> 00:00</span>
-    </div>
+    if (msg.type === "auth_success" && msg.role === "manager") {
+      loginDiv.style.display = "none";
+      dashDiv.style.display = "block";
+      return;
+    }
 
-    <h4>🎤 Mic</h4>
-    <div class="box" id="mic-${callId}"></div>
+    /* ===== CALL START ===== */
+    if (msg.type === "agent_join") {
+      createCallCard(msg.agent, msg.callId, msg.startTime);
+      return;
+    }
 
-    <h4>🖥️ Tab Audio</h4>
-    <div class="box" id="tab-${callId}"></div>
+    /* ===== TRANSCRIPT ===== */
+    if (msg.type === "transcript" && msg.final) {
+      const call = calls[msg.callId];
+      if (!call) return;
 
-    <h4>🧠 Call Summary</h4>
-    <div class="summary" id="summary-${callId}">
-      <em>Call in progress…</em>
-    </div>
-  `;
+      const box = msg.source === "mic" ? call.mic : call.tab;
+      box.innerHTML += msg.text + "<br>";
+      box.scrollTop = box.scrollHeight;
+      return;
+    }
 
-  /* 🔝 Newest calls on TOP */
-  agentsContainer.prepend(card);
-
-  const durationEl = card.querySelector(`#duration-${callId}`);
-
-  const timer = setInterval(() => {
-    const diff = Math.floor((Date.now() - startTime) / 1000);
-    const m = Math.floor(diff / 60);
-    const s = diff % 60;
-    durationEl.innerHTML =
-      `<strong>Duration:</strong> ${m}:${s.toString().padStart(2, "0")}`;
-  }, 1000);
-
-  calls[callId] = {
-    card,
-    mic: card.querySelector(`#mic-${callId}`),
-    tab: card.querySelector(`#tab-${callId}`),
-    summary: card.querySelector(`#summary-${callId}`),
-    durationEl,
-    timer,
-    startTime
+    /* ===== CALL END ===== */
+    if (msg.type === "summary") {
+      endCall(msg.callId, msg.summary);
+    }
   };
 }
 
-/* ================= WEBSOCKET (PRODUCTION-SAFE) ================= */
-const protocol = location.protocol === "https:" ? "wss" : "ws";
-const ws = new WebSocket(`${protocol}://${location.host}`);
-
-ws.onmessage = (e) => {
-  let msg;
-  try { msg = JSON.parse(e.data); } catch { return; }
-
-  /* ===== AGENT START ===== */
-  if (msg.type === "agent_join") {
-    createCallCard(msg.agent, msg.callId, msg.startTime);
-    return;
-  }
-
-  /* ===== TRANSCRIPT ===== */
-  if (msg.type === "transcript" && msg.final) {
-    const call = calls[msg.callId];
-    if (!call) return;
-
-    const box = msg.source === "mic" ? call.mic : call.tab;
-    box.innerHTML += msg.text + "<br>";
-    box.scrollTop = box.scrollHeight;
-    return;
-  }
-
-  /* ===== SUMMARY / CALL END ===== */
-  if (msg.type === "summary") {
-    const call = calls[msg.callId];
-    if (!call) return;
-
-    clearInterval(call.timer);
-
-    call.durationEl.innerHTML += " (Final)";
-    call.summary.innerHTML =
-      `<strong>Summary</strong><br>${msg.summary.replace(/\n/g, "<br>")}`;
-
-    call.card.classList.add("ended");
-  }
+/* ================= LOGIN ================= */
+loginBtn.onclick = () => {
+  connectWS(
+    username.value.trim(),
+    password.value
+  );
 };
+
+/* ================= AGENT SECTION ================= */
+function getAgentSection(agent) {
+  if (agentSections[agent]) return agentSections[agent];
+
+  const section = document.createElement("div");
+  section.className = "agent-section";
+  section.innerHTML = `
+    <div class="agent-title">👤 ${agent}</div>
+    <div class="calls-grid"></div>
+  `;
+
+  agentsRoot.prepend(section);
+
+  agentSections[agent] = section.querySelector(".calls-grid");
+  return agentSections[agent];
+}
+
+/* ================= CREATE CALL ================= */
+function createCallCard(agent, callId, startTime) {
+  const grid = getAgentSection(agent);
+
+  const card = document.createElement("div");
+  card.className = "call-card";
+  card.innerHTML = `
+    <div class="status live">LIVE</div>
+    <div class="meta"><strong>Started:</strong> ${new Date(startTime).toLocaleTimeString()}</div>
+
+    <h4>🎤 Mic</h4>
+    <div class="box"></div>
+
+    <h4>🖥️ Tab</h4>
+    <div class="box"></div>
+
+    <h4>🧠 Summary</h4>
+    <div class="summary"><em>Call in progress…</em></div>
+  `;
+
+  // 🔥 LIVE CALL ALWAYS LEFT
+  grid.prepend(card);
+
+  calls[callId] = {
+    agent,
+    card,
+    mic: card.querySelectorAll(".box")[0],
+    tab: card.querySelectorAll(".box")[1],
+    summary: card.querySelector(".summary")
+  };
+}
+
+/* ================= END CALL ================= */
+function endCall(callId, summary) {
+  const call = calls[callId];
+  if (!call) return;
+
+  call.card.classList.add("ended");
+  const badge = call.card.querySelector(".status");
+  badge.textContent = "ENDED";
+  badge.className = "status ended-status";
+
+  call.summary.innerHTML = summary;
+}
 </script>
 
 </body>

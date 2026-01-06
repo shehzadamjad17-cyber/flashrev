@@ -1,8 +1,23 @@
-import "dotenv/config";
 import express from "express";
+import { WebSocketServer, WebSocket } from "ws";
+import dotenv from "dotenv";
+import crypto from "crypto";
 import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
 import fetch from "node-fetch";
+
+dotenv.config();
+
+/* ================= CONFIG ================= */
+const PORT = process.env.PORT || 3000;
+const DEEPGRAM_KEY = process.env.DEEPGRAM_API_KEY;
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+
+/* ================= USERS ================= */
+const USERS = {
+  user1: { password: "password1", role: "agent" },
+  user2: { password: "password2", role: "agent" },
+  manager: { password: "manager123", role: "manager" }
+};
 
 /* ================= EXPRESS ================= */
 const app = express();
@@ -11,34 +26,31 @@ app.use(express.static("public"));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-/* ================= HELPERS ================= */
-function broadcast(obj) {
-  const msg = JSON.stringify(obj);
-  for (const c of wss.clients) {
-    if (c.readyState === WebSocket.OPEN) {
-      c.send(msg);
+/* ================= MANAGER BROADCAST ================= */
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN && c.role === "manager") {
+      c.send(data);
     }
-  }
-}
-
-function generateCallId() {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  });
 }
 
 /* ================= GEMINI SUMMARY ================= */
-async function generateSummary(agent, transcriptText) {
-  if (!transcriptText.trim()) return "No conversation detected.";
+async function summarizeWithGemini(transcriptText) {
+  if (!transcriptText.trim()) {
+    return "No conversation detected.";
+  }
 
   const prompt = `
 You are an AI call analysis assistant.
 
-1. Describe the tone of the speakers.
-2. Suggest how the call could be improved.
-3. List 3–5 key points.
+Summarize the following call in EXACTLY 5 concise bullet-style lines.
+Each line should be short, clear, and meaningful.
 
-Conversation:
+Call transcript:
 ${transcriptText}
-`;
+`.trim();
 
   try {
     const res = await fetch(
@@ -48,7 +60,10 @@ ${transcriptText}
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [
-            { role: "user", parts: [{ text: prompt }] }
+            {
+              role: "user",
+              parts: [{ text: prompt }]
+            }
           ]
         })
       }
@@ -57,6 +72,7 @@ ${transcriptText}
     const data = await res.json();
 
     if (data.error) {
+      console.error("❌ Gemini error:", data.error.message);
       return `Gemini error: ${data.error.message}`;
     }
 
@@ -65,167 +81,220 @@ ${transcriptText}
     const textPart = parts.find(p => p.text);
 
     return textPart?.text || "Summary text missing.";
+
   } catch (e) {
     console.error("❌ Gemini failure:", e.message);
     return "Summary generation failed.";
   }
 }
 
+
 /* ================= DEEPGRAM ================= */
-function openDeepgram(ws, source) {
+function createDeepgramSocket(ws, callId, source) {
   const dg = new WebSocket(
-    "wss://api.deepgram.com/v1/listen" +
-      "?model=nova-2" +
-      "&language=en-US" +
-      "&encoding=linear16" +
-      "&sample_rate=16000" +
-      "&channels=1" +
-      "&interim_results=true" +
-      "&smart_format=true" +
-      "&punctuate=true",
-    {
-      headers: {
-        Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`
-      }
-    }
+    "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1",
+    { headers: { Authorization: `Token ${DEEPGRAM_KEY}` } }
   );
 
-  dg.ready = false;
-  dg.buffer = [];
+  dg.onopen = () => {
+    console.log(`🎧 Deepgram connected (${source})`);
+  };
 
-  dg.on("open", () => {
-    dg.ready = true;
-    dg.buffer.forEach(chunk => dg.send(chunk));
-    dg.buffer.length = 0;
-    console.log(`🟢 DG OPEN [${source}] | ${ws.agent} | ${ws.callId}`);
-  });
-
-  dg.on("message", (msg) => {
+  dg.onmessage = (msg) => {
     let data;
     try {
-      data = JSON.parse(msg.toString());
+      data = JSON.parse(msg.data.toString());
     } catch {
       return;
     }
 
     const alt = data.channel?.alternatives?.[0];
-    if (!alt?.transcript) return;
+    if (!alt || !alt.transcript) return;
 
-    // 🔥 FINAL SENTENCES ONLY
-    if (!data.is_final) return;
-
-    const text = alt.transcript.trim();
-    if (!text) return;
-
-    ws.transcripts.push(text);
+    if (data.is_final) {
+      ws.transcripts[source].push(alt.transcript);
+    }
 
     broadcast({
       type: "transcript",
-      agent: ws.agent,
-      callId: ws.callId,
+      callId,
       source,
-      text,
-      final: true
+      text: alt.transcript,
+      final: data.is_final
     });
-  });
+  };
 
-  dg.on("close", () => {
-    console.log(`🔴 DG CLOSED [${source}] | ${ws.agent} | ${ws.callId}`);
-  });
+  dg.onerror = err => {
+    console.error(`❌ Deepgram error (${source})`, err.message);
+  };
 
-  dg.on("error", (e) => {
-    console.error(`❌ DG ERROR [${source}]`, e.message);
-  });
+  dg.onclose = () => {
+    console.log(`🔌 Deepgram closed (${source})`);
+  };
 
   return dg;
 }
 
 /* ================= WEBSOCKET ================= */
 wss.on("connection", (ws) => {
-  console.log("🔌 Client connected");
+  ws.isAuthenticated = false;
+  ws.username = null;
+  ws.role = null;
 
-  ws.agent = null;
+  ws.callActive = false;
   ws.callId = null;
-  ws.startTime = null;
-  ws.currentSource = "mic";
-  ws.transcripts = [];
 
-  ws.on("message", (data, isBinary) => {
+  ws.dgMic = null;
+  ws.dgTab = null;
+  ws.lastBinaryType = null;
 
-    /* ===== CONTROL MESSAGES ===== */
-    if (!isBinary) {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
+  ws.transcripts = {
+    mic: [],
+    tab: []
+  };
 
-      if (msg.type === "agent_join") {
-        ws.agent = msg.agent;
-        ws.callId = generateCallId();   // 🔥 UNIQUE SESSION
-        ws.startTime = Date.now();
+  ws.on("message", async (data) => {
 
-        console.log("👤 Agent joined:", ws.agent, ws.callId);
+    /* ---------- TRY JSON ---------- */
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      /* ---------- BINARY AUDIO ---------- */
+      if (!ws.callActive) return;
 
-        broadcast({
-          type: "agent_join",
-          agent: ws.agent,
-          callId: ws.callId,
-          startTime: ws.startTime
-        });
-
-        ws.dgMic = openDeepgram(ws, "mic");
-        ws.dgTab = openDeepgram(ws, "tab");
-        return;
+      if (
+        ws.lastBinaryType === "mic" &&
+        ws.dgMic &&
+        ws.dgMic.readyState === WebSocket.OPEN
+      ) {
+        ws.dgMic.send(data);
       }
 
-      if (msg.type === "audio_source") {
-        ws.currentSource = msg.source; // mic | tab
-        return;
+      if (
+        ws.lastBinaryType === "tab" &&
+        ws.dgTab &&
+        ws.dgTab.readyState === WebSocket.OPEN
+      ) {
+        ws.dgTab.send(data);
       }
 
       return;
     }
 
-    /* ===== AUDIO STREAM ===== */
-    const dg =
-      ws.currentSource === "mic" ? ws.dgMic : ws.dgTab;
+    /* ================= AUTH ================= */
+    if (msg.type === "auth") {
+      const user = USERS[msg.username];
+      if (!user || user.password !== msg.password) {
+        ws.send(JSON.stringify({ type: "auth_failed" }));
+        return;
+      }
 
-    if (!dg) return;
+      ws.isAuthenticated = true;
+      ws.username = msg.username;
+      ws.role = user.role;
 
-    if (dg.ready && dg.readyState === WebSocket.OPEN) {
-      dg.send(data);
-    } else {
-      dg.buffer.push(data);
+      ws.send(JSON.stringify({
+        type: "auth_success",
+        username: ws.username,
+        role: ws.role
+      }));
+
+      if (ws.role === "agent") {
+        broadcast({ type: "agent_online", agent: ws.username });
+      }
+
+      console.log(`🔐 Authenticated: ${ws.username} (${ws.role})`);
+      return;
+    }
+
+    if (!ws.isAuthenticated) return;
+
+    /* ================= START CALL ================= */
+    if (msg.type === "agent_start" && ws.role === "agent") {
+      ws.callId = crypto.randomUUID();
+      ws.callActive = true;
+
+      ws.transcripts = { mic: [], tab: [] };
+
+      ws.dgMic = createDeepgramSocket(ws, ws.callId, "mic");
+      ws.dgTab = createDeepgramSocket(ws, ws.callId, "tab");
+
+      broadcast({
+        type: "agent_join",
+        agent: ws.username,
+        callId: ws.callId,
+        startTime: Date.now()
+      });
+
+      console.log(`📞 Call started by ${ws.username}`);
+      return;
+    }
+
+    /* ================= STOP CALL ================= */
+    if (msg.type === "agent_stop" && ws.callActive) {
+      ws.callActive = false;
+
+      ws.dgMic?.close();
+      ws.dgTab?.close();
+
+      const micText = ws.transcripts.mic.join(" ");
+      const tabText = ws.transcripts.tab.join(" ");
+
+      const combinedTranscript = `
+AGENT SPEECH:
+${micText || "No agent speech detected."}
+
+SYSTEM / TAB AUDIO:
+${tabText || "No system audio detected."}
+      `.trim();
+
+      let summary = "Summary could not be generated.";
+
+      try {
+        summary = await summarizeWithGemini(combinedTranscript);
+      } catch (err) {
+        console.error("❌ Gemini summary error:", err.message);
+      }
+
+      broadcast({
+        type: "summary",
+        callId: ws.callId,
+        summary: summary.replace(/\n/g, "<br>")
+      });
+
+      ws.dgMic = null;
+      ws.dgTab = null;
+
+      console.log(`🛑 Call ended by ${ws.username}`);
+      return;
+    }
+
+    /* ================= AUDIO SOURCE TAG ================= */
+    if (msg.type === "audio_mic") {
+      ws.lastBinaryType = "mic";
+      return;
+    }
+
+    if (msg.type === "audio_tab") {
+      ws.lastBinaryType = "tab";
+      return;
     }
   });
 
-  ws.on("close", async () => {
-    console.log("❌ Agent disconnected:", ws.agent, ws.callId);
-
-    try { ws.dgMic?.close(); } catch {}
-    try { ws.dgTab?.close(); } catch {}
-
-    if (!ws.agent || !ws.callId) return;
-
-    console.log("🧠 Generating summary:", ws.agent, ws.callId);
-
-    const summary = await generateSummary(
-      ws.agent,
-      ws.transcripts.join(" ")
-    );
-
-    broadcast({
-      type: "summary",
-      agent: ws.agent,
-      callId: ws.callId,
-      summary
-    });
-
-    console.log("✅ Summary sent:", ws.agent, ws.callId);
+  ws.on("close", () => {
+    if (ws.role === "agent") {
+      broadcast({ type: "agent_offline", agent: ws.username });
+      ws.dgMic?.close();
+      ws.dgTab?.close();
+      console.log(`🔴 Agent disconnected: ${ws.username}`);
+    }
   });
 });
 
 /* ================= START ================= */
-server.listen(3000, () => {
-  console.log("🚀 Server running");
-  console.log("👉 http://localhost:3000/agent.html");
-  console.log("👉 http://localhost:3000/manager.html");
+server.listen(PORT, () => {
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
+  console.log("Deepgram key loaded:", !!DEEPGRAM_KEY);
+  console.log("Gemini key loaded:", !!GEMINI_KEY);
 });

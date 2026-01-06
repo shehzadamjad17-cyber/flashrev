@@ -2,176 +2,180 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Agent Audio (Mic + Tab, Stable)</title>
+  <title>Agent Console</title>
 
   <style>
-    body { font-family: Arial, sans-serif; }
-    pre {
-      background: #111;
-      color: #0f0;
-      padding: 10px;
-      height: 260px;
-      overflow-y: auto;
-      font-family: monospace;
-      font-size: 13px;
+    body { font-family: Arial, sans-serif; background:#f5f5f5; padding:20px; }
+    .box {
+      background:#111; color:#0f0; padding:10px;
+      height:220px; overflow-y:auto;
+      font-family:monospace; font-size:13px;
     }
-    label { margin-right: 14px; }
+    input { padding:6px; margin:4px 0; }
+    button { padding:6px 14px; margin-top:6px; }
+    label { margin-right:12px; }
+    .hidden { display:none; }
   </style>
 </head>
 <body>
 
-<h2>Agent Audio (Mic + Tab, No Echo)</h2>
+<h2>🎤 Agent Console (Dual Source)</h2>
 
-<input id="name" placeholder="Agent name" />
-<br><br>
+<!-- 🔐 LOGIN -->
+<div id="login">
+  <h3>Agent Login</h3>
+  <input id="username" placeholder="Username"><br>
+  <input id="password" type="password" placeholder="Password"><br>
+  <button id="loginBtn">Login</button>
+</div>
 
-<label><input type="checkbox" id="useMic" checked> 🎤 Mic</label>
-<label><input type="checkbox" id="useTab"> 🖥️ Tab Audio</label>
+<!-- 🎙️ APP -->
+<div id="app" class="hidden">
+  <p><strong>Logged in as:</strong> <span id="agentName"></span></p>
 
-<br><br>
+  <label><input type="checkbox" id="useMic" checked> 🎤 Mic</label>
+  <label><input type="checkbox" id="useTab"> 🖥️ Tab Audio</label>
 
-<button id="start">Start</button>
-<button id="stop" disabled>Stop</button>
+  <br><br>
 
-<pre id="log"></pre>
+  <button id="start">Start Call</button>
+  <button id="stop" disabled>Stop Call</button>
+
+  <h4>Log</h4>
+  <div class="box" id="log"></div>
+</div>
 
 <script>
-let ws, ctx;
-let micStream, tabStream;
-let micProcessor, tabProcessor;
+/* ================= STATE ================= */
+let ws;
+let ctx;
 let running = false;
 
-const logEl = document.getElementById("log");
+let micStream, tabStream;
+let micProcessor, tabProcessor;
 
+const logEl = document.getElementById("log");
+const loginDiv = document.getElementById("login");
+const appDiv = document.getElementById("app");
+const startBtn = document.getElementById("start");
+const stopBtn = document.getElementById("stop");
+
+/* ================= LOG ================= */
 function log(msg) {
-  logEl.textContent += msg + "\n";
+  logEl.innerHTML += msg + "<br>";
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-/* ===== PCM CONVERSION ===== */
-function floatTo16BitPCM(float32Array) {
-  const buffer = new ArrayBuffer(float32Array.length * 2);
+/* ================= PCM ================= */
+function floatTo16BitPCM(float32) {
+  const buffer = new ArrayBuffer(float32.length * 2);
   const view = new DataView(buffer);
   let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let sample = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  for (let i = 0; i < float32.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
   }
   return buffer;
 }
 
-/* ===== SEND AUDIO ===== */
-function sendAudio(source, pcmBuffer) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  ws.send(JSON.stringify({
-    type: "audio_source",
-    source: source
-  }));
-
-  ws.send(pcmBuffer);
-}
-
-/* ===== START ===== */
-document.getElementById("start").onclick = async () => {
-  if (running) return;
-
-  const agent = document.getElementById("name").value.trim();
-  if (!agent) return alert("Enter agent name");
-
-  const useMic = document.getElementById("useMic").checked;
-  const useTab = document.getElementById("useTab").checked;
-  if (!useMic && !useTab) return alert("Select at least one audio source");
-
-  log(`Starting agent: ${agent}`);
-
-  ctx = new AudioContext({ sampleRate: 16000 });
-  await ctx.resume();
-
-  /* 🔇 Silent sink (keeps graph alive, no sound) */
-  const silentGain = ctx.createGain();
-  silentGain.gain.value = 0;
-  silentGain.connect(ctx.destination);
-
-  /* ✅ PRODUCTION-SAFE WEBSOCKET */
+/* ================= WS ================= */
+function connectWS() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${protocol}://${location.host}`);
   ws.binaryType = "arraybuffer";
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({
-      type: "agent_join",
-      agent: agent
-    }));
-    log("WebSocket connected");
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === "auth_success") {
+      document.getElementById("agentName").textContent = msg.username;
+      loginDiv.classList.add("hidden");
+      appDiv.classList.remove("hidden");
+      log("✅ Authenticated");
+    }
+
+    if (msg.type === "auth_failed") {
+      alert("Invalid credentials");
+    }
   };
 
-  ws.onclose = () => log("WebSocket closed");
+  ws.onclose = () => log("❌ WebSocket closed");
+}
 
-  /* ===== MIC AUDIO ===== */
+/* ================= LOGIN ================= */
+loginBtn.onclick = () => {
+  connectWS();
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      type: "auth",
+      username: username.value.trim(),
+      password: password.value
+    }));
+  };
+};
+
+/* ================= START CALL ================= */
+startBtn.onclick = async () => {
+  if (running) return;
+
+  const useMic = document.getElementById("useMic").checked;
+  const useTab = document.getElementById("useTab").checked;
+  if (!useMic && !useTab) return alert("Select Mic or Tab");
+
+  ws.send(JSON.stringify({ type: "agent_start" }));
+  running = true;
+
+  ctx = new AudioContext({ sampleRate: 16000 });
+  await ctx.resume();
+
+  const silent = ctx.createGain();
+  silent.gain.value = 0;
+  silent.connect(ctx.destination);
+
   if (useMic) {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-        sampleRate: 16000
-      }
-    });
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const src = ctx.createMediaStreamSource(micStream);
+    micProcessor = ctx.createScriptProcessor(2048, 1, 1);
+    src.connect(micProcessor);
+    micProcessor.connect(silent);
 
-    const micSource = ctx.createMediaStreamSource(micStream);
-    micProcessor = ctx.createScriptProcessor(1024, 1, 1);
-
-    micSource.connect(micProcessor);
-    micProcessor.connect(silentGain);
-
-    micProcessor.onaudioprocess = (e) => {
+    micProcessor.onaudioprocess = e => {
       if (!running) return;
-      const pcm = floatTo16BitPCM(e.inputBuffer.getChannelData(0));
-      sendAudio("mic", pcm);
+      ws.send(JSON.stringify({ type: "audio_mic" }));
+      ws.send(floatTo16BitPCM(e.inputBuffer.getChannelData(0)));
     };
 
-    log("🎤 Mic connected (enhanced)");
+    log("🎤 Mic streaming");
   }
 
-  /* ===== TAB AUDIO ===== */
   if (useTab) {
-    log("Select a TAB and enable 'Share tab audio'");
-    tabStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: true
-    });
+    tabStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+    if (tabStream.getAudioTracks().length) {
+      const src = ctx.createMediaStreamSource(tabStream);
+      tabProcessor = ctx.createScriptProcessor(2048, 1, 1);
+      src.connect(tabProcessor);
+      tabProcessor.connect(silent);
 
-    if (tabStream.getAudioTracks().length === 0) {
-      log("❌ Tab audio NOT shared");
-    } else {
-      const tabSource = ctx.createMediaStreamSource(tabStream);
-      tabProcessor = ctx.createScriptProcessor(1024, 1, 1);
-
-      tabSource.connect(tabProcessor);
-      tabProcessor.connect(silentGain);
-
-      tabProcessor.onaudioprocess = (e) => {
+      tabProcessor.onaudioprocess = e => {
         if (!running) return;
-        const pcm = floatTo16BitPCM(e.inputBuffer.getChannelData(0));
-        sendAudio("tab", pcm);
+        ws.send(JSON.stringify({ type: "audio_tab" }));
+        ws.send(floatTo16BitPCM(e.inputBuffer.getChannelData(0)));
       };
 
-      log("🖥️ Tab audio connected");
+      log("🖥️ Tab audio streaming");
     }
   }
 
-  running = true;
-  document.getElementById("start").disabled = true;
-  document.getElementById("stop").disabled = false;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  log("▶ Call started");
 };
 
-/* ===== STOP ===== */
-document.getElementById("stop").onclick = () => {
+/* ================= STOP CALL ================= */
+stopBtn.onclick = () => {
   if (!running) return;
 
-  log("Stopping agent...");
+  ws.send(JSON.stringify({ type: "agent_stop" }));
   running = false;
 
   micProcessor?.disconnect();
@@ -181,14 +185,14 @@ document.getElementById("stop").onclick = () => {
   micStream?.getTracks().forEach(t => t.stop());
   tabStream?.getTracks().forEach(t => t.stop());
 
-  ws?.close();
+  micProcessor = tabProcessor = null;
+  micStream = tabStream = null;
+  ctx = null;
 
-  ws = ctx = micProcessor = tabProcessor = micStream = tabStream = null;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
 
-  document.getElementById("start").disabled = false;
-  document.getElementById("stop").disabled = true;
-
-  log("Agent stopped");
+  log("⏹ Call stopped");
 };
 </script>
 
